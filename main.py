@@ -3,6 +3,11 @@ import glob
 import json
 import os
 import time
+# Compat shim: flash-attn 2.8+ uses torch.library.wrap_triton (added in torch 2.5).
+# We're on torch 2.4; stub it as a passthrough.
+import torch as _torch_compat
+if not hasattr(_torch_compat.library, 'wrap_triton'):
+    _torch_compat.library.wrap_triton = lambda fn: fn
 
 import fsspec
 import hydra
@@ -653,6 +658,15 @@ def main(config):
     _sudoku_eval(**kwargs)
   elif config.mode == 'train':
     _train(**kwargs)
+  elif config.mode == 'psi_train_v1':
+    from psi.trainers.psi_train_v1 import _psi_train_v1
+    _psi_train_v1(**kwargs)
+  elif config.mode == 'psi_train_v2':
+    from psi.trainers.psi_train_v2_divfree import _psi_train_v2
+    _psi_train_v2(**kwargs)
+  elif config.mode == 'psi_train_c':
+    from psi.trainers.psi_train_c import _psi_train_c
+    _psi_train_c(**kwargs)
   else:
     raise ValueError(config.mode)
 

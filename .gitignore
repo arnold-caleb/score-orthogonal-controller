@@ -9,6 +9,22 @@ notes.md
 grid_search.sh
 *.ipynb
 
+# Dataset caches (regenerated on first run)
+data_cache/
+data_cache_psi/
+
+# Model checkpoints (too large for git)
+checkpoints/
+
+# Trained psi state (regenerable, not tracked)
+*.pt
+!psi_*.pt.example
+
+# SLURM output / hydra runs
+.hydra/
+slurm-*.out
+slurm-*.err
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

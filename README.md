@@ -1,202 +1,91 @@
-# Language Modeling with Hyperspherical Flows
+# score-orthogonal-controller
 
-By [Justin Deschenaux](https://jdeschena.com) and [Caglar Gulcehre](https://www.caglar.ai).
+Experiments on **frozen flow control via tangent residuals** on a continuous-time
+flow language model (S-FLM). The base S-FLM repo is preserved as-is (see
+[`README_SFLM.md`](README_SFLM.md)); our additions live under `psi/`.
 
-[![arXiv](https://img.shields.io/badge/arXiv-2605.11125-red.svg)](https://arxiv.org/abs/2605.11125)
-[![Blog](https://img.shields.io/badge/Blog%20%20-8A2BE2)](https://jdeschena.com/blog/sfm)
-[![HuggingFace](https://img.shields.io/badge/🤗-Huggingface-blue)](https://huggingface.co/jdeschena/s-flm)
+We ask:
 
+> Can a small learned residual vector field `ψ(z, τ, c)`, added to a frozen flow
+> LM's velocity during sampling, improve verifiable reasoning accuracy (GSM8K)
+> **without** updating the base model — and does constraining `ψ` to live in
+> the score-orthogonal subspace of the frozen flow's velocity field (a
+> level-set / "circulation-like" controller) buy us anything over an
+> unconstrained residual?
 
-**Abstract**: Continuous Flow Language Models (FLMs) transport noise to data with a deterministic ODE, avoiding the factorized-sampling assumption of discrete diffusion. But standard FLMs operate on one-hot vectors whose dimension scales with the vocabulary, making them expensive to train. 𝕊-FLM instead operate on the hypersphere, where we transport random points towards the clean embeddings via rotations. Previous FLMs match AR in Generative Perplexity, **but high-likelihood samples are not necessarily correct in verifiable domains like math and code**; 𝕊-FLM substantially improves over previous FLMs on GSM8K!
+The base model is the public S-FLM TinyGSM sphere-arch checkpoint
+(135M params; GSM8K baseline 12.51% at 32 sampler steps). We never touch its
+weights — `ψ` is a separate ~1.86M-param FiLM-MLP whose output is
+**hard-projected** to the sphere tangent at `z` (always) and optionally
+also to the orthogonal complement of the spherical score (the
+score-orthogonal / circulation variant).
 
-This repository contains training and evaluation code for 𝕊-FLM along with the discrete-diffusion / flow-matching baselines we compare against (AR, MDLM, Duo, FLM, CANDI). We release pretrained checkpoints for two settings:
+## Variants
 
-- **TinyGSM**: math reasoning, SmolLM-135M tokenizer, 250k steps.
-- **OpenWebText (OWT)**: general LM, GPT-2 tokenizer, 1M steps.
+| Trainer | Objective | Constraint on ψ | Status |
+|---|---|---|---|
+| **A** `psi.trainers.v1_supervised`  | Match slerp-velocity target via MSE             | tangent-to-sphere only | A = 9.86% (hurt baseline) |
+| **B** `psi.trainers.v2_divfree`     | A + soft `div_S(ψ) + ψ·s` penalty                | tangent + soft div penalty | B = 12.51% (penalty pinned ψ→0; null) |
+| **C** `psi.trainers.v3_reinforce`   | REINFORCE on GSM8K verifier reward               | **hard score-orthogonal** | active debugging |
 
-In addition, we provide training and evaluation scripts (no released checkpoints) for **Sudoku** (synthetic puzzle dataset, 9-digit vocab + clue-tokens, 20k steps; difficulty levels: easy / medium / hard).
+> ⚠️ The `CirculationPsiNet` name is for code continuity only.
+> The hard projection enforces `ψ ⊥ z` **and** `ψ ⊥ ŝ_τ`, which is a
+> **score-orthogonal / level-set tangent controller** — *not* exact
+> `∇·(p_τ ψ) = 0` (would also require `∇_S·ψ = 0`).
 
-[Getting started](#getting-started) · [Checkpoints](#checkpoints) · [Training](#training) · [Sampling & evaluation](#sampling--evaluation) · [Citation](#citation)
+## Layout
 
-# Getting started
+```
+psi/
+├── nets/             # ψ architectures (sphere-tangent, score-orthogonal)
+├── samplers/         # SFM samplers with ψ injection + trajectory recording
+├── trainers/         # variant A / B / C trainers
+├── data/             # GSM8K loaders (train-target and RL-prompt formats)
+├── diagnostics/      # standalone reproducers & comparison scripts
+└── slurms/           # SLURM submit scripts
+```
 
-Create a fresh environment and install the Python dependencies:
+The base S-FLM repo is the rest of this tree (left intact, with small additive
+edits to `main.py` and `samplers.py` to dispatch to our trainers and samplers).
+
+## How to run
 
 ```bash
-conda create -n sfm python=3.12
-conda activate sfm
-pip install -r requirements.txt
+# Baseline sanity (verify checkpoint reproduces 12.51%)
+sbatch psi/slurms/baseline.slurm
+sbatch psi/slurms/sanity_zero.slurm   # sfm_psi with ψ=0 → should also be 12.51%
+
+# Train + eval a variant
+sbatch psi/slurms/train_v1.slurm   # variant A: supervised
+sbatch psi/slurms/train_v2.slurm   # variant B: div penalty
+sbatch psi/slurms/train_v3.slurm   # variant C: REINFORCE
+
+# Eval a trained ψ on GSM8K test
+PSI_CKPT=outputs/psi_v1A/psi_step8000.pt TAG=v1A sbatch psi/slurms/eval.slurm
 ```
 
-`requirements.txt` intentionally does **not** pin `torch` or `numpy`. We work inside the NGC PyTorch container (`nvcr.io/nvidia/pytorch:25.02-py3`) which already ships matching CUDA / cuDNN / NCCL builds; pip-installing torch on top of that will mess up the NGC build. If you are not using the container, install `torch` and `numpy` (we use `torch==2.7.0`, `numpy==1.26.4`) **before** running `pip install -r requirements.txt`.
+## Gotchas (load-bearing)
 
-# Checkpoints
+- The frozen model uses EMA weights. The trainer must call `model._eval_mode()`
+  AFTER load to swap EMA shadow params into the main parameters. Setting
+  `eval.disable_ema=true` nulls `model.ema` BEFORE `_eval_mode()` runs, which
+  silently leaves the model on the raw (non-EMA) weights → produces gibberish.
+- The base S-FLM model is in EVAL mode at sample time (via `backbone.eval()`
+  inside `_eval_mode()`); do not put it back in train mode.
+- `flash-attn` 2.8+ uses `torch.library.wrap_triton` (added in torch 2.5);
+  we monkey-patch it to identity at the top of `main.py` for torch 2.4.
+- The YAML `separator: '\n'` is the **literal** two-character `\n` (backslash
+  + n), not a newline. The frozen model was trained with this literal
+  separator.
 
-All the checkpoints are in the HuggingFace repo [`jdeschena/s-flm`](https://huggingface.co/jdeschena/s-flm).
+## Results so far
 
-### Layout on Huggingface
-
-```
-tinygsm/                                              # trained on TinyGSM, 250k steps
-  ar.ckpt
-  mdlm.ckpt
-  duo.ckpt
-  candi/{lr3e-4,lr1e-3}.ckpt                          # CANDI uses a smaller learning rate in certain configs, hence we try with both
-  flm/{default,caps}.ckpt                             # FLMs use attention softcapping and a custom logits processing. We experiment with and without.
-  sfm/sphere_dit_truncated_fixed_no_renorm.ckpt       # Standard DiT, truncated schedule
-  sfm/sphere_dit_truncated_adaptive_no_renorm.ckpt    # Standard DiT, truncated+adaptive schedule
-  sfm/sphere_arch_truncated_adaptive_no_renorm.ckpt   # S-arch (nGPT-inspired), truncated+adaptive schedule
-
-owt/                                                  # trained on OpenWebText, 1M steps
-  ar.ckpt
-  mdlm.ckpt
-  duo.ckpt
-  flm.ckpt                                            # Original FLM checkpoint of https://github.com/david3684/flm
-  sfm.ckpt                                            # S-arch, truncated+adaptive schedule
-```
-
-### Download
-
-A single checkpoint:
-
-```bash
-huggingface-cli download jdeschena/s-flm tinygsm/duo.ckpt \
-    --local-dir ./checkpoints
-```
-
-The whole repo (or a subset):
-
-```bash
-# Everything (~47 GB):
-huggingface-cli download jdeschena/s-flm --local-dir ./checkpoints
-
-# Just TinyGSM:
-huggingface-cli download jdeschena/s-flm --local-dir ./checkpoints \
-    --include 'tinygsm/**'
-```
-
-# Training
-
-All training scripts are in `scripts/train/`. Each script is self-contained and exposes a few environment variables for overrides: `OUTPUT_DIR`, `CACHE_DIR`, `NUM_NODES`, `DEVICES`. They were originally run on 2 nodes with 4 GPUs (TinyGSM) or 4 nodes with 4 GPUs (OWT).
-
-| Dataset | Algorithm | Script |
-|---|---|---|
-| TinyGSM | AR | [`scripts/train/tinygsm/ar.sh`](scripts/train/tinygsm/ar.sh) |
-| TinyGSM | MDLM | [`scripts/train/tinygsm/mdlm.sh`](scripts/train/tinygsm/mdlm.sh) |
-| TinyGSM | Duo | [`scripts/train/tinygsm/duo.sh`](scripts/train/tinygsm/duo.sh) |
-| TinyGSM | FLM (default) | [`scripts/train/tinygsm/flm_default.sh`](scripts/train/tinygsm/flm_default.sh) |
-| TinyGSM | FLM (w/ softcapping) | [`scripts/train/tinygsm/flm_caps.sh`](scripts/train/tinygsm/flm_caps.sh) |
-| TinyGSM | CANDI (lr 3e-4) | [`scripts/train/tinygsm/candi_lr3e-4.sh`](scripts/train/tinygsm/candi_lr3e-4.sh) |
-| TinyGSM | CANDI (lr 1e-3) | [`scripts/train/tinygsm/candi_lr1e-3.sh`](scripts/train/tinygsm/candi_lr1e-3.sh) |
-| TinyGSM | SFM: sphere-DiT, fixed truncated | [`scripts/train/tinygsm/sfm_sphere_dit_truncated_fixed_no_renorm.sh`](scripts/train/tinygsm/sfm_sphere_dit_truncated_fixed_no_renorm.sh) |
-| TinyGSM | SFM: sphere-DiT, adaptive truncated | [`scripts/train/tinygsm/sfm_sphere_dit_truncated_adaptive_no_renorm.sh`](scripts/train/tinygsm/sfm_sphere_dit_truncated_adaptive_no_renorm.sh) |
-| TinyGSM | SFM: SphereArch, adaptive truncated | [`scripts/train/tinygsm/sfm_sphere_arch_truncated_adaptive_no_renorm.sh`](scripts/train/tinygsm/sfm_sphere_arch_truncated_adaptive_no_renorm.sh) |
-| OWT | AR | [`scripts/train/owt/ar.sh`](scripts/train/owt/ar.sh) |
-| OWT | MDLM | [`scripts/train/owt/mdlm.sh`](scripts/train/owt/mdlm.sh) |
-| OWT | Duo | [`scripts/train/owt/duo.sh`](scripts/train/owt/duo.sh) |
-| OWT | FLM | [`scripts/train/owt/flm.sh`](scripts/train/owt/flm.sh) |
-| OWT | SFM | [`scripts/train/owt/sfm.sh`](scripts/train/owt/sfm.sh) |
-| Sudoku | AR | [`scripts/train/sudoku/ar.sh`](scripts/train/sudoku/ar.sh) |
-| Sudoku | MDLM | [`scripts/train/sudoku/mdlm.sh`](scripts/train/sudoku/mdlm.sh) |
-| Sudoku | Duo | [`scripts/train/sudoku/duo.sh`](scripts/train/sudoku/duo.sh) |
-| Sudoku | FLM | [`scripts/train/sudoku/flm.sh`](scripts/train/sudoku/flm.sh) |
-| Sudoku | CANDI | [`scripts/train/sudoku/candi.sh`](scripts/train/sudoku/candi.sh) |
-| Sudoku | SFM | [`scripts/train/sudoku/sfm.sh`](scripts/train/sudoku/sfm.sh) |
-| Sudoku | SFM (truncated) | [`scripts/train/sudoku/sfm_truncated.sh`](scripts/train/sudoku/sfm_truncated.sh) |
-| Sudoku | SFM (truncated + adaptive) | [`scripts/train/sudoku/sfm_truncated_adaptive.sh`](scripts/train/sudoku/sfm_truncated_adaptive.sh) |
-
-Sudoku scripts accept a `DIFFICULTY` environment variable (`easy` / `medium` / `hard`).
-
-Example:
-
-```bash
-DEVICES=8 NUM_NODES=1 \
-OUTPUT_DIR=./outputs/sfm_tinygsm \
-bash scripts/train/tinygsm/sfm_sphere_arch_truncated_adaptive_no_renorm.sh
-```
-
-# Sampling & evaluation
-
-Sampling/eval scripts are in `scripts/sample/` and expose the same overrides plus `CKPT_PATH` and `STEPS` (default 32).
-
-For TinyGSM, the sampling script uses the GSM8K test and writes a per-example JSON to `OUTPUT_DIR`; On OWT, we generate unconditional samples and computes generative perplexity.
-
-| Setting | Algorithm | Script |
-|---|---|---|
-| TinyGSM | AR | [`scripts/sample/tinygsm/ar.sh`](scripts/sample/tinygsm/ar.sh) |
-| TinyGSM | MDLM | [`scripts/sample/tinygsm/mdlm.sh`](scripts/sample/tinygsm/mdlm.sh) |
-| TinyGSM | Duo | [`scripts/sample/tinygsm/duo.sh`](scripts/sample/tinygsm/duo.sh) |
-| TinyGSM | FLM (default) | [`scripts/sample/tinygsm/flm_default.sh`](scripts/sample/tinygsm/flm_default.sh) |
-| TinyGSM | FLM (w/ softcapping) | [`scripts/sample/tinygsm/flm_caps.sh`](scripts/sample/tinygsm/flm_caps.sh) |
-| TinyGSM | CANDI (lr 3e-4) | [`scripts/sample/tinygsm/candi_lr3e-4.sh`](scripts/sample/tinygsm/candi_lr3e-4.sh) |
-| TinyGSM | CANDI (lr 1e-3) | [`scripts/sample/tinygsm/candi_lr1e-3.sh`](scripts/sample/tinygsm/candi_lr1e-3.sh) |
-| TinyGSM | SFM: sphere-DiT, fixed truncated | [`scripts/sample/tinygsm/sfm_sphere_dit_truncated_fixed_no_renorm.sh`](scripts/sample/tinygsm/sfm_sphere_dit_truncated_fixed_no_renorm.sh) |
-| TinyGSM | SFM: sphere-DiT, adaptive truncated | [`scripts/sample/tinygsm/sfm_sphere_dit_truncated_adaptive_no_renorm.sh`](scripts/sample/tinygsm/sfm_sphere_dit_truncated_adaptive_no_renorm.sh) |
-| TinyGSM | SFM: SphereArch, adaptive truncated | [`scripts/sample/tinygsm/sfm_sphere_arch_truncated_adaptive_no_renorm.sh`](scripts/sample/tinygsm/sfm_sphere_arch_truncated_adaptive_no_renorm.sh) |
-| OWT | AR | [`scripts/sample/owt/ar.sh`](scripts/sample/owt/ar.sh) |
-| OWT | MDLM | [`scripts/sample/owt/mdlm.sh`](scripts/sample/owt/mdlm.sh) |
-| OWT | Duo | [`scripts/sample/owt/duo.sh`](scripts/sample/owt/duo.sh) |
-| Sudoku | AR | [`scripts/sample/sudoku/ar.sh`](scripts/sample/sudoku/ar.sh) |
-| Sudoku | MDLM | [`scripts/sample/sudoku/mdlm.sh`](scripts/sample/sudoku/mdlm.sh) |
-| Sudoku | Duo | [`scripts/sample/sudoku/duo.sh`](scripts/sample/sudoku/duo.sh) |
-| Sudoku | FLM | [`scripts/sample/sudoku/flm.sh`](scripts/sample/sudoku/flm.sh) |
-| Sudoku | CANDI | [`scripts/sample/sudoku/candi.sh`](scripts/sample/sudoku/candi.sh) |
-| Sudoku | SFM | [`scripts/sample/sudoku/sfm.sh`](scripts/sample/sudoku/sfm.sh) |
-| Sudoku | SFM (truncated) | [`scripts/sample/sudoku/sfm_truncated.sh`](scripts/sample/sudoku/sfm_truncated.sh) |
-| Sudoku | SFM (truncated + adaptive) | [`scripts/sample/sudoku/sfm_truncated_adaptive.sh`](scripts/sample/sudoku/sfm_truncated_adaptive.sh) |
-| OWT | FLM | [`scripts/sample/owt/flm.sh`](scripts/sample/owt/flm.sh) |
-| OWT | SFM | [`scripts/sample/owt/sfm.sh`](scripts/sample/owt/sfm.sh) |
-
-Example: evaluate an SFM checkpoint on TinyGSM after 64 sampling steps:
-
-```bash
-CKPT_PATH=./checkpoints/tinygsm/sfm/sphere_arch_truncated_adaptive_no_renorm.ckpt \
-STEPS=64 \
-OUTPUT_DIR=./eval_runs/sfm_tinygsm \
-bash scripts/sample/tinygsm/sfm_sphere_arch_truncated_adaptive_no_renorm.sh
-```
-
-### SFM sampling modes
-
-The SFM sampling scripts (all 3 TinyGSM SFM scripts and `scripts/sample/owt/sfm.sh`) expose two extra environment variables:
-
-- `VELOCITY`: `exact` (default, deterministic velocity) or `sample` (sample from the velocity distribution).
-- `TOPK_VELOCITY`: `-1` (default, full vocab — no top-k filtering) or a positive integer (e.g. `1`, `10`) to restrict the velocity to the top-k tokens.
-
-```bash
-# Default: exact velocity, full vocab (no top-k).
-bash scripts/sample/tinygsm/sfm_sphere_arch_truncated_adaptive_no_renorm.sh
-
-# Top-1 velocity, sampled (paper's headline setup).
-TOPK_VELOCITY=1 VELOCITY=sample bash scripts/sample/tinygsm/sfm_sphere_arch_truncated_adaptive_no_renorm.sh
-
-# Top-10 velocity, exact.
-TOPK_VELOCITY=10 bash scripts/sample/tinygsm/sfm_sphere_arch_truncated_adaptive_no_renorm.sh
-
-# No top-k (full vocab), sampled velocity.
-VELOCITY=sample bash scripts/sample/tinygsm/sfm_sphere_arch_truncated_adaptive_no_renorm.sh
-```
-
-# Acknowledgements
-
-This codebase builds on a number of excellent open-source projects:
-
-- [**Duo**](https://github.com/s-sahoo/duo): discrete diffusion baseline; our overall training/eval scaffolding is descended from theirs.
-- [**FLM**](https://github.com/david3684/flm): original Flow Language Model implementation; our OWT FLM checkpoint is the released checkpoint from this repo, and our FLM training/sampling code follows it.
-- [**CANDI**](https://github.com/patrickpynadath1/candi-diffusion): continuous-and-discrete diffusion baseline (imported).
-- [**PUMA**](https://github.com/JaeyeonKim01/PUMA): reference for the TinyGSM data preparation.
-- [**PRISM**](https://github.com/JaeyeonKim01/PRISM): reference for the Sudoku data preparation.
-
-# Citation
-
-```
-@misc{deschenaux2026languagemodelinghypersphericalflows,
-      title={Language Modeling with Hyperspherical Flows}, 
-      author={Justin Deschenaux and Caglar Gulcehre},
-      year={2026},
-      eprint={2605.11125},
-      archivePrefix={arXiv},
-      primaryClass={cs.LG},
-      url={https://arxiv.org/abs/2605.11125}, 
-}
-```
+- Baseline (no ψ, 32 steps): **12.51%** (165/1319)
+- Sanity (sfm_psi sampler with ψ=0): **12.51%** ✓ identical
+- Variant A (\|ψ\| ≈ 0.5, unconstrained tangent residual): **9.86%** — *hurt*
+  (off-manifold failure mode)
+- A scaled at inference: ≈ baseline at \|ψ\| ≲ 0.25, ≈ 9.86% at \|ψ\| ≈ 0.5
+- Variant B (soft div penalty): \|ψ\| collapsed to ≈ 0.001; **= baseline**
+  (the penalty conflicted with the supervised target → ψ→0, never visited
+  the constrained subspace)
+- Variant C (hard projection + REINFORCE): active debugging

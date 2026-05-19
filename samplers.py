@@ -1056,6 +1056,85 @@ def get_sampler(config):
       top_k_velocity=s.top_k_velocity,
       invert_time_convention=config.algo.invert_time_convention)
 
+  if s.predictor == 'sfm_psi_circ':
+    # Circulation-constrained tangent residual sampler. psi_net is
+    # loaded from SFLM_PSI_CKPT and architectural-projected to be
+    # orthogonal to both z (sphere) and the tangent score (circulation).
+    import os as _os
+    import torch as _torch
+    from psi.samplers.psi_circ_sampler import SFMSamplerWithPsiCirc
+    from psi.nets.psi_circ_net import CirculationPsiNet
+    sampler = SFMSamplerWithPsiCirc(
+      psi_net=None,
+      noise_removal=s.noise_removal,
+      velocity=s.velocity, use_float64=s.use_float64,
+      slerp_float64=config.algo.slerp_precision=='float64',
+      eps=config.algo.eps, temperature=s.temperature,
+      p_nucleus=s.p_nucleus, top_k=s.top_k,
+      top_k_velocity=s.top_k_velocity,
+      invert_time_convention=config.algo.invert_time_convention)
+    ckpt_path = _os.environ.get('SFLM_PSI_CKPT', '').strip()
+    d_sphere  = int(_os.environ.get('SFLM_PSI_D', '0') or 0)
+    hidden    = int(_os.environ.get('SFLM_PSI_HIDDEN', '512'))
+    psi_scale = float(_os.environ.get('SFLM_PSI_SCALE', '1.0') or 1.0)
+    if d_sphere > 0:
+      psi_net = CirculationPsiNet(d=d_sphere, hidden=hidden)
+      if ckpt_path:
+        state = _torch.load(ckpt_path, map_location='cpu')
+        sd_in = state['psi_state'] if 'psi_state' in state else state
+        own = psi_net.state_dict()
+        matched = {k: v for k, v in sd_in.items()
+                   if k in own and own[k].shape == v.shape}
+        psi_net.load_state_dict(matched, strict=False)
+        print(f'[sfm_psi_circ] Loaded {len(matched)}/{len(own)} keys '
+              f'from {ckpt_path}')
+      else:
+        print('[sfm_psi_circ] No SFLM_PSI_CKPT; using zero-init psi.')
+      psi_net = psi_net.cuda().eval()
+      sampler.attach_psi(psi_net)
+      if psi_scale != 1.0:
+        sampler.set_psi_scale(psi_scale)
+        print(f'[sfm_psi_circ] psi_scale={psi_scale}')
+    return sampler
+
+  if s.predictor == 'sfm_psi':
+    # Solenoidal-residual SFM sampler. The psi network is loaded from
+    # env var SFLM_PSI_CKPT (None => zero-init network => sanity reduces
+    # to vanilla SFM).
+    import os as _os
+    import torch as _torch
+    from psi.samplers.psi_sphere_sampler import SFMSamplerWithPsi
+    from psi.nets.psi_sphere_net import SphereSolenoidalNet
+    sampler = SFMSamplerWithPsi(
+      psi_net=None,
+      noise_removal=s.noise_removal,
+      velocity=s.velocity, use_float64=s.use_float64,
+      slerp_float64=config.algo.slerp_precision=='float64',
+      eps=config.algo.eps, temperature=s.temperature,
+      p_nucleus=s.p_nucleus, top_k=s.top_k,
+      top_k_velocity=s.top_k_velocity,
+      invert_time_convention=config.algo.invert_time_convention)
+    ckpt_path = _os.environ.get('SFLM_PSI_CKPT', '').strip()
+    d_sphere = int(_os.environ.get('SFLM_PSI_D', '0') or 0)
+    hidden = int(_os.environ.get('SFLM_PSI_HIDDEN', '512'))
+    psi_scale = float(_os.environ.get('SFLM_PSI_SCALE', '1.0') or 1.0)
+    if psi_scale != 1.0:
+      sampler.set_psi_scale(psi_scale)
+      print(f'[sfm_psi] psi_scale={psi_scale}')
+    if d_sphere > 0:
+      psi_net = SphereSolenoidalNet(d=d_sphere, hidden=hidden)
+      if ckpt_path:
+        state = _torch.load(ckpt_path, map_location='cpu')
+        psi_net.load_state_dict(state['psi_state'] if 'psi_state' in state else state)
+        print(f'[sfm_psi] Loaded psi checkpoint from {ckpt_path}')
+      else:
+        print('[sfm_psi] No SFLM_PSI_CKPT set; using zero-init psi (vanilla SFM sanity).')
+      psi_net = psi_net.cuda().eval()
+      sampler.attach_psi(psi_net)
+    else:
+      print('[sfm_psi] SFLM_PSI_D not set; psi disabled (vanilla SFM).')
+    return sampler
+
   if s.predictor == 'flm_euler':
     return FLMEulerSampler(
       use_float64=s.use_float64,
