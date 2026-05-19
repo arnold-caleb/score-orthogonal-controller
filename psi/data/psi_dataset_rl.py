@@ -20,7 +20,13 @@ from torch.utils.data import Dataset
 
 
 class GSM8KRLDataset(Dataset):
-    def __init__(self, tokenizer, block_size, separator='\n',
+    # CRITICAL: separator default is the LITERAL two-character string '\n'
+    # (backslash + n), which is what the YAML config encodes via
+    # `separator: '\n'` (single-quoted YAML does NOT process escapes).
+    # The frozen S-FLM model was trained against this literal separator;
+    # passing the Python newline character would produce a different
+    # token after the prompt and the model would never emit `def …`.
+    def __init__(self, tokenizer, block_size, separator='\\n',
                  cache_path=None, hf_split='train', max_prompt_len=None):
         records = _load_gsm8k_pairs(cache_path, hf_split)
         BOS = tokenizer.bos_token_id

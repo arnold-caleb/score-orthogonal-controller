@@ -17,7 +17,9 @@ from torch.utils.data import Dataset
 
 
 class GSM8KTrainDataset(Dataset):
-    def __init__(self, tokenizer, block_size, separator='\n',
+    # Default separator is the LITERAL two-character '\n' (backslash+n)
+    # to match the YAML config and what the frozen model was trained on.
+    def __init__(self, tokenizer, block_size, separator='\\n',
                  cache_path=None, hf_split='train'):
         # 1. Get raw pairs
         records = _load_gsm8k_train_pairs(cache_path, hf_split)
