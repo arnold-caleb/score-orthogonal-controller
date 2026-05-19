@@ -68,13 +68,13 @@ python -u -m main \
     trainer.devices=1 \
     +psi.n_steps=1500 \
     +psi.gsm8k_train_cache=/n/fs/aa-rldiff/winter/s-flm/data/gsm8k_test_as_train.json \
-    +psi.use_internal_sampler=true \
+    +psi.use_internal_sampler=false \
     +psi.lr=1e-4 \
     +psi.hidden=512 \
     +psi.prompt_batch=2 \
     +psi.K_rollouts=4 \
     +psi.sampler_steps=32 \
-    +psi.sigma_explore=0.0 \
+    +psi.sigma_explore=0.05 \
     +psi.max_prompt_len=192 \
     +psi.verifier_timeout_s=2.0 \
     +psi.verifier_workers=8 \

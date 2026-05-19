@@ -64,7 +64,16 @@ def _score_batch(responses, gold_answers, timeout_s=2.0, **_):
 # REINFORCE loss from a recorded trajectory
 # ─────────────────────────────────────────────────────────────────────
 def _reinforce_loss(psi_net, trajectory, advantage, sigma_explore):
-    """advantage: (B*K,). Returns scalar loss."""
+    """advantage: (B*K,). Returns scalar loss.
+
+    If `trajectory` is empty (e.g. ran with use_internal_sampler=true so
+    no trajectory was recorded), there is nothing to learn from — return
+    a 0-valued tensor that's autograd-safe.
+    """
+    if len(trajectory) == 0:
+        # Make a dummy 0-loss tied to psi params so .backward() works.
+        zero = sum(p.sum() * 0 for p in psi_net.parameters())
+        return zero
     log_pi_sum = None
     for entry in trajectory:
         z       = entry['z']
