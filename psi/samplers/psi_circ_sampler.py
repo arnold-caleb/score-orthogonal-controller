@@ -131,15 +131,23 @@ class SFMSamplerWithPsiCirc(SFMSampler):
 
         # Record for REINFORCE
         if self.record_trajectory:
+            B_x = x.shape[0]
+            # Always save alpha as a 1-d (B,) tensor — psi_net.forward
+            # expects (B,) for the sinusoidal embedding.
+            if torch.is_tensor(alpha_t):
+                alpha_saved = alpha_t.detach().reshape(-1).to(x.dtype)
+            else:
+                alpha_saved = torch.tensor(float(alpha_t), device=x.device,
+                                            dtype=x.dtype).reshape(1)
+            if alpha_saved.numel() == 1:
+                alpha_saved = alpha_saved.expand(B_x).contiguous()
             self.trajectory.append({
                 'z':         x.detach().clone(),
                 'v_sfm':     v_sfm.detach(),
                 'psi':       psi_val.detach() if psi_val is not None else None,
                 'score':     score.detach() if score is not None else None,
                 'c':         c.detach() if c is not None else None,
-                'alpha':     (alpha_t.detach() if torch.is_tensor(alpha_t)
-                              else torch.tensor(float(alpha_t),
-                                                device=x.device)),
+                'alpha':     alpha_saved,
                 'dt':        float(dt),
                 'drift':     drift.detach(),
                 'xi':        xi.detach() if xi is not None else None,
